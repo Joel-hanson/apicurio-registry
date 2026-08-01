@@ -143,6 +143,21 @@ public class KafkaSqlConfiguration {
     @Getter
     String snapshotStoreLocation;
 
+    @ConfigProperty(name = "apicurio.kafkasql.snapshot.seek.enabled", defaultValue = "true")
+    @Info(category = CATEGORY_STORAGE, description = "When true, KafkaSQL bootstrap seeks the journal consumer past the snapshot marker instead of scanning and discarding pre-snapshot messages.", availableSince = "3.3.1")
+    @Getter
+    boolean snapshotSeekEnabled;
+
+    @ConfigProperty(name = "apicurio.kafkasql.snapshot.kafka-store.enabled", defaultValue = "false")
+    @Info(category = CATEGORY_STORAGE, description = "When true, KafkaSQL also publishes snapshot dump bytes as chunked records on the snapshots topic so pods can restore without a durable local filesystem.", availableSince = "3.3.1")
+    @Getter
+    boolean snapshotKafkaStoreEnabled;
+
+    @ConfigProperty(name = "apicurio.kafkasql.snapshot.kafka-store.chunk-bytes", defaultValue = "393216")
+    @Info(category = CATEGORY_STORAGE, description = "Raw dump bytes per Kafka snapshot chunk before Base64 encoding (keep well under broker message.max.bytes).", availableSince = "3.3.1")
+    @Getter
+    Integer snapshotKafkaStoreChunkBytes;
+
     // === Events topic and related configurations ===
 
     @ConfigProperty(name = "apicurio.events.kafka.topic", defaultValue = "registry-events")

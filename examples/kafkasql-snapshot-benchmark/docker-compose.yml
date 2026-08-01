@@ -1,0 +1,20 @@
+# Isolated H2 snapshot-format benchmark (no Kafka / Registry required).
+#
+#   docker compose up --build
+#
+# Scale the dataset:
+#   ROWS=5000 CONTENT_BYTES=16384 docker compose up --build
+services:
+  snapshot-bench:
+    build: .
+    environment:
+      ROWS: ${ROWS:-2000}
+      CONTENT_BYTES: ${CONTENT_BYTES:-8192}
+      WARMUP: ${WARMUP:-1}
+      ITERATIONS: ${ITERATIONS:-3}
+      WORK_DIR: /tmp/bench-work
+    volumes:
+      - bench-work:/tmp/bench-work
+
+volumes:
+  bench-work:

@@ -78,12 +78,12 @@ public class H2SqlStatements extends CommonSqlStatements {
 
     @Override
     public String createDataSnapshot() {
-        return "SCRIPT TO ?";
+        return "SCRIPT TO ? COMPRESSION GZIP";
     }
 
     @Override
     public String restoreFromSnapshot() {
-        return "RUNSCRIPT FROM ?";
+        return "RUNSCRIPT FROM ? COMPRESSION GZIP";
     }
 
     @Override

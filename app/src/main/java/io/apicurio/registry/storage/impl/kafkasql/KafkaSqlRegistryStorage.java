@@ -67,22 +67,26 @@ import jakarta.enterprise.event.Event;
 import jakarta.inject.Inject;
 import jakarta.inject.Named;
 import org.apache.commons.lang3.tuple.Pair;
+import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.ProducerRecord;
-import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.TopicPartition;
 import org.slf4j.Logger;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+import java.util.stream.Stream;
 
 import static io.apicurio.registry.storage.impl.kafkasql.KafkaSqlSubmitter.BOOTSTRAP_MESSAGE_TYPE;
 import static io.apicurio.registry.utils.ConcurrentUtil.blockOnResult;
@@ -155,6 +159,14 @@ public class KafkaSqlRegistryStorage extends ReadOnlyDelegatingStorage implement
     // Reference to the consumer thread for health checks
     private volatile Thread consumerThread = null;
 
+    private static final ObjectMapper SNAPSHOT_MAPPER = new ObjectMapper();
+
+    /**
+     * Bootstrap state recovered from the snapshots topic (snapshot id for legacy scan, optional journal seek).
+     */
+    private record SnapshotBootstrapInfo(String snapshotId, SnapshotMetadata.JournalPosition journalPosition) {
+    }
+
     @Override
     public String storageName() {
         return "kafkasql";
@@ -180,7 +192,7 @@ public class KafkaSqlRegistryStorage extends ReadOnlyDelegatingStorage implement
 
         // Try to restore the internal database from a snapshot
         final long bootstrapStart = System.currentTimeMillis();
-        String snapshotId = consumeSnapshotsTopic(snapshotsConsumer);
+        SnapshotBootstrapInfo snapshotBootstrap = consumeSnapshotsTopic(snapshotsConsumer);
 
         // Once the topics are created, and the snapshots processed, initialize the internal SQL Storage.
         sqlStore.initialize();
@@ -188,7 +200,7 @@ public class KafkaSqlRegistryStorage extends ReadOnlyDelegatingStorage implement
 
         // Once the SQL storage has been initialized, start the Kafka consumer thread.
         log.info("SQL store initialized, starting consumer thread.");
-        startConsumerThread(journalConsumer, snapshotId, bootstrapStart);
+        startConsumerThread(journalConsumer, snapshotBootstrap, bootstrapStart);
     }
 
     @Override
@@ -223,23 +235,26 @@ public class KafkaSqlRegistryStorage extends ReadOnlyDelegatingStorage implement
      * restores the internal database using the snapshot's content. Polls in a loop until all messages
      * are consumed from the topic.
      */
-    private String consumeSnapshotsTopic(KafkaConsumer<String, String> snapshotsConsumer) {
+    private SnapshotBootstrapInfo consumeSnapshotsTopic(KafkaConsumer<String, String> snapshotsConsumer) {
         // Subscribe to the snapshots topic
         Collection<String> topics = Collections.singleton(configuration.getSnapshotsTopic());
         snapshotsConsumer.subscribe(topics);
 
-        // Wait for partition assignment
+        List<ConsumerRecord<String, String>> snapshots = new ArrayList<>();
+
+        // Wait for partition assignment. Keep any records returned by these polls — discarding them
+        // would skip the only snapshot metadata on a small topic (same class of bug as journal seek).
         var assigned = snapshotsConsumer.assignment();
         while (assigned.isEmpty()) {
-            snapshotsConsumer.poll(configuration.getPollTimeout());
+            ConsumerRecords<String, String> polled = snapshotsConsumer.poll(configuration.getPollTimeout());
+            if (polled != null && !polled.isEmpty()) {
+                polled.forEach(snapshots::add);
+            }
             assigned = snapshotsConsumer.assignment();
         }
 
         // Record the current end offsets so we stop there, even if other pods produce new snapshots
         var endOffsets = snapshotsConsumer.endOffsets(assigned);
-
-        List<ConsumerRecord<String, String>> snapshots = new ArrayList<>();
-        String snapshotRecordKey = null;
 
         // Poll until we reach the original end offsets or get an empty result
         ConsumerRecords<String, String> records;
@@ -253,38 +268,116 @@ public class KafkaSqlRegistryStorage extends ReadOnlyDelegatingStorage implement
                 && endOffsets.entrySet().stream()
                         .anyMatch(e -> snapshotsConsumer.position(e.getKey()) < e.getValue()));
 
-        if (!snapshots.isEmpty()) {
-            log.info("Found {} total snapshots in the snapshots topic.", snapshots.size());
+        if (snapshots.isEmpty()) {
+            return new SnapshotBootstrapInfo(null, null);
+        }
 
-            // sort snapshots by timestamp
-            snapshots.sort(Comparator.comparingLong(ConsumerRecord::timestamp));
+        log.info("Found {} total records in the snapshots topic.", snapshots.size());
 
-            Path mostRecentSnapshotPath = null;
-            for (ConsumerRecord<String, String> snapshotFound : snapshots) {
-                // Restore database from snapshot
-                try {
-                    String path = snapshotFound.value();
-                    if (null != path && !path.isBlank() && Files.exists(Path.of(snapshotFound.value()))) {
-                        log.debug("Snapshot with path {} found.", snapshotFound.value());
-                        snapshotRecordKey = snapshotFound.key();
-                        mostRecentSnapshotPath = Path.of(snapshotFound.value());
-                    }
-                } catch (IllegalArgumentException ex) {
-                    log.warn(
-                            "Snapshot with path {} ignored, the snapshot is likely invalid or cannot be found",
-                            snapshotFound.value());
-                }
+        // Index Kafka-resident dump chunks (key = {snapshotId}/chunk/{i}).
+        List<KafkaSnapshotStore.KeyedValue> keyed = new ArrayList<>(snapshots.size());
+        for (ConsumerRecord<String, String> record : snapshots) {
+            keyed.add(new KafkaSnapshotStore.KeyedValue(record.key(), record.value()));
+        }
+        Map<String, Map<Integer, String>> chunksBySnapshot = KafkaSnapshotStore.indexChunks(keyed);
+
+        // Prefer newest complete snapshot (local file and/or Kafka chunks).
+        snapshots.sort((a, b) -> Long.compare(b.timestamp(), a.timestamp()));
+
+        for (ConsumerRecord<String, String> snapshotFound : snapshots) {
+            if (KafkaSnapshotStore.isChunkKey(snapshotFound.key())) {
+                continue;
             }
+            try {
+                SnapshotMetadata metadata = parseSnapshotMetadata(snapshotFound.value());
+                if (metadata == null) {
+                    continue;
+                }
 
-            // Here we have the most recent snapshot that we can find, try to restore the internal database
-            // from it.
-            if (null != mostRecentSnapshotPath) {
-                log.info("Restoring snapshot {} to the internal database...", mostRecentSnapshotPath);
-                sqlStore.restoreFromSnapshot(mostRecentSnapshotPath.toString());
+                Path localPath = null;
+                if (metadata.getPath() != null && !metadata.getPath().isBlank()) {
+                    Path candidate = Path.of(metadata.getPath());
+                    if (Files.exists(candidate)) {
+                        localPath = candidate;
+                    } else {
+                        log.debug("Snapshot path {} not present on local filesystem.", metadata.getPath());
+                    }
+                }
+
+                boolean kafkaStore = KafkaSnapshotStore.isKafkaStorage(metadata)
+                        && metadata.getChunkCount() != null && metadata.getChunkCount() > 0;
+                Map<Integer, String> chunks = kafkaStore ? chunksBySnapshot.get(snapshotFound.key()) : null;
+                boolean kafkaComplete = kafkaStore
+                        && KafkaSnapshotStore.hasAllChunks(chunks, metadata.getChunkCount());
+
+                if (localPath == null && !kafkaComplete) {
+                    if (kafkaStore) {
+                        log.warn(
+                                "Skipping incomplete Kafka-resident snapshot {} (chunks present: {}, expected: {})",
+                                snapshotFound.key(), chunks == null ? 0 : chunks.size(),
+                                metadata.getChunkCount());
+                    }
+                    continue;
+                }
+
+                Path restorePath = localPath;
+                Path materialized = null;
+                try {
+                    if (restorePath == null) {
+                        materialized = KafkaSnapshotStore.materializeToTempFile(snapshotFound.key(), chunks,
+                                metadata.getChunkCount());
+                        restorePath = materialized;
+                    }
+                    log.info("Restoring snapshot {} to the internal database (storage={}, path={})...",
+                            snapshotFound.key(),
+                            kafkaStore ? KafkaSnapshotStore.STORAGE_KAFKA
+                                    : KafkaSnapshotStore.STORAGE_FILESYSTEM,
+                            restorePath);
+                    sqlStore.restoreFromSnapshot(restorePath.toString());
+                    if (metadata.getJournal() != null) {
+                        SnapshotMetadata.JournalPosition journalPosition = metadata.getJournal();
+                        log.info("Snapshot includes journal seek position {}:{}@{}",
+                                journalPosition.getTopic(), journalPosition.getPartition(),
+                                journalPosition.getOffset());
+                    }
+                    return new SnapshotBootstrapInfo(snapshotFound.key(), metadata.getJournal());
+                } finally {
+                    if (materialized != null) {
+                        try {
+                            Files.deleteIfExists(materialized);
+                        } catch (IOException e) {
+                            log.warn("Failed to delete materialized snapshot {}: {}", materialized,
+                                    e.getMessage());
+                        }
+                    }
+                }
+            } catch (IllegalArgumentException | IOException | RegistryStorageException ex) {
+                log.warn("Snapshot record {} ignored: {}", snapshotFound.key(), ex.getMessage());
             }
         }
 
-        return snapshotRecordKey;
+        log.info("No usable snapshot found on the snapshots topic; will replay the full journal.");
+        return new SnapshotBootstrapInfo(null, null);
+    }
+
+    /**
+     * Parse snapshot topic value. Supports legacy plain path strings and versioned JSON metadata.
+     */
+    private SnapshotMetadata parseSnapshotMetadata(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        String trimmed = value.trim();
+        if (trimmed.startsWith("{")) {
+            try {
+                return SNAPSHOT_MAPPER.readValue(trimmed, SnapshotMetadata.class);
+            } catch (Exception e) {
+                log.warn("Failed to parse snapshot metadata JSON, ignoring entry: {}", e.getMessage());
+                return null;
+            }
+        }
+        return SnapshotMetadata.builder().version(0).path(trimmed)
+                .storage(KafkaSnapshotStore.STORAGE_FILESYSTEM).build();
     }
 
     /**
@@ -293,19 +386,50 @@ public class KafkaSqlRegistryStorage extends ReadOnlyDelegatingStorage implement
      * model.
      */
     private void startConsumerThread(final KafkaConsumer<KafkaSqlMessageKey, KafkaSqlMessage> consumer,
-                                     String snapshotId, long bootstrapStart) {
+            SnapshotBootstrapInfo snapshotBootstrap, long bootstrapStart) {
         log.info("Starting KSQL consumer thread on topic: {}", configuration.getTopic());
         log.info("Bootstrap servers: {}", configuration.getBootstrapServers());
 
         final String bootstrapId = UUID.randomUUID().toString();
+        final String snapshotId = snapshotBootstrap != null ? snapshotBootstrap.snapshotId() : null;
+        final SnapshotMetadata.JournalPosition journalPosition = snapshotBootstrap != null
+                ? snapshotBootstrap.journalPosition()
+                : null;
         submitter.submitBootstrap(bootstrapId);
 
         Runnable runner = () -> {
             try {
                 log.info("Subscribing to {}", configuration.getTopic());
-                // Subscribe to the journal topic
+                // Subscribe to the journal topic. Seek (when enabled) must happen in the rebalance
+                // listener once partitions are assigned — seeking before assignment is ignored/racy.
                 Collection<String> topics = Collections.singleton(configuration.getTopic());
-                consumer.subscribe(topics);
+                consumer.subscribe(topics, new ConsumerRebalanceListener() {
+                    @Override
+                    public void onPartitionsRevoked(Collection<TopicPartition> partitions) {
+                        // no-op
+                    }
+
+                    @Override
+                    public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
+                        log.info("Journal partitions assigned: {}", partitions);
+                        if (journalPosition == null || !configuration.isSnapshotSeekEnabled()) {
+                            return;
+                        }
+                        String topic = journalPosition.getTopic() != null ? journalPosition.getTopic()
+                                : configuration.getTopic();
+                        TopicPartition tp = new TopicPartition(topic, journalPosition.getPartition());
+                        if (!partitions.contains(tp)) {
+                            log.warn(
+                                    "Snapshot journal partition {} not in assignment {}; falling back to scan-and-discard",
+                                    tp, partitions);
+                            return;
+                        }
+                        long seekTo = journalPosition.getOffset() + 1;
+                        consumer.seek(tp, seekTo);
+                        snapshotProcessed = true;
+                        log.info("Seeked journal consumer past snapshot marker to {} offset {}", tp, seekTo);
+                    }
+                });
 
                 // Main consumer loop
                 while (!stopped) {
@@ -345,12 +469,13 @@ public class KafkaSqlRegistryStorage extends ReadOnlyDelegatingStorage implement
                                 }
                             }
                         } else {
-                            // If there is no snapshot, simply process the existing messages in the kafka
-                            // topic as usual.
+                            // If there is no snapshot, or we already sought past it, process messages as usual.
                             records.forEach(record -> processRecord(record, bootstrapId, bootstrapStart));
                         }
                     }
                 }
+            } catch (Throwable t) {
+                log.error("KafkaSQL journal consumer thread failed", t);
             } finally {
                 try {
                     consumer.close();
@@ -1271,20 +1396,93 @@ public class KafkaSqlRegistryStorage extends ReadOnlyDelegatingStorage implement
     @Override
     public String triggerSnapshotCreation() throws RegistryStorageException {
         // First we generate an identifier for the snapshot, then we send a snapshot marker to the journal
-        // topic.
+        // topic. Use .sql.gz because H2 SCRIPT TO writes with COMPRESSION GZIP.
         String snapshotId = UUID.randomUUID().toString();
-        Path path = Path.of(configuration.getSnapshotStoreLocation(), snapshotId + ".sql");
+        Path path = Path.of(configuration.getSnapshotStoreLocation(), snapshotId + ".sql.gz");
         var message = new CreateSnapshot1Message(path.toString(), snapshotId);
         this.lastTriggeredSnapshot = snapshotId;
         log.debug("Snapshot with id {} triggered.", snapshotId);
         var uuid = blockOnResult(submitter.submitMessage(message));
-        String snapshotLocation = (String) coordinator.waitForResponse(uuid);
+        Object response = coordinator.waitForResponse(uuid);
+
+        String snapshotLocation;
+        SnapshotMetadata.JournalPosition journalPosition = null;
+        if (response instanceof SnapshotCreationResult creationResult) {
+            snapshotLocation = creationResult.snapshotLocation();
+            journalPosition = SnapshotMetadata.JournalPosition.builder().topic(creationResult.journalTopic())
+                    .partition(creationResult.journalPartition()).offset(creationResult.journalOffset())
+                    .build();
+        } else if (response instanceof String location) {
+            // Defensive: older sink behavior returned the path string only.
+            snapshotLocation = location;
+        } else {
+            throw new RegistryStorageException(
+                    "Unexpected snapshot creation response type: " + (response == null ? "null" : response.getClass()));
+        }
+
+        var metadataBuilder = SnapshotMetadata.builder()
+                .version(SnapshotMetadata.CURRENT_VERSION).path(snapshotLocation)
+                .storage(KafkaSnapshotStore.STORAGE_FILESYSTEM).journal(journalPosition);
+
+        if (configuration.isSnapshotKafkaStoreEnabled()) {
+            try {
+                Path dumpPath = Path.of(snapshotLocation);
+                List<String> chunks = KafkaSnapshotStore.readFileAsBase64Chunks(dumpPath,
+                        configuration.getSnapshotKafkaStoreChunkBytes());
+                log.info("Publishing Kafka-resident snapshot {} ({} chunks)...", snapshotId, chunks.size());
+                for (int i = 0; i < chunks.size(); i++) {
+                    ProducerRecord<String, String> chunkRecord = new ProducerRecord<>(
+                            configuration.getSnapshotsTopic(), 0, KafkaSnapshotStore.chunkKey(snapshotId, i),
+                            chunks.get(i), Collections.emptyList());
+                    blockOnResult(snapshotsProducer.apply(chunkRecord));
+                }
+                metadataBuilder.storage(KafkaSnapshotStore.STORAGE_KAFKA).chunkCount(chunks.size());
+            } catch (IOException e) {
+                throw new RegistryStorageException(
+                        "Failed to publish Kafka-resident snapshot chunks for " + snapshotId, e);
+            }
+        }
+
+        SnapshotMetadata metadata = metadataBuilder.build();
+        String metadataJson;
+        try {
+            metadataJson = SNAPSHOT_MAPPER.writeValueAsString(metadata);
+        } catch (Exception e) {
+            throw new RegistryStorageException("Failed to serialize snapshot metadata", e);
+        }
+
         // Then we send a new message to the snapshots topic, using the snapshot id as the key of the snapshot
-        // message.
+        // message. Publish metadata after chunks so incomplete uploads are skipped on restore.
         ProducerRecord<String, String> record = new ProducerRecord<>(configuration.getSnapshotsTopic(), 0,
-                snapshotId, snapshotLocation, Collections.emptyList());
-        RecordMetadata recordMetadata = blockOnResult(snapshotsProducer.apply(record));
+                snapshotId, metadataJson, Collections.emptyList());
+        blockOnResult(snapshotsProducer.apply(record));
+        deleteOlderSnapshotFiles(Path.of(snapshotLocation));
         return snapshotLocation;
+    }
+
+    /**
+     * Remove older snapshot dumps in the same directory so ephemeral volumes (e.g. /tmp) do not fill up.
+     * Keeps the just-created snapshot file.
+     */
+    private void deleteOlderSnapshotFiles(Path keep) {
+        if (keep == null || keep.getParent() == null || !Files.isDirectory(keep.getParent())) {
+            return;
+        }
+        try (Stream<Path> files = Files.list(keep.getParent())) {
+            files.filter(Files::isRegularFile).filter(candidate -> !candidate.equals(keep)).filter(candidate -> {
+                String name = candidate.getFileName().toString();
+                return name.endsWith(".sql") || name.endsWith(".sql.gz");
+            }).forEach(candidate -> {
+                try {
+                    Files.deleteIfExists(candidate);
+                    log.info("Deleted old KafkaSQL snapshot file: {}", candidate);
+                } catch (IOException e) {
+                    log.warn("Failed to delete old KafkaSQL snapshot file {}: {}", candidate, e.getMessage());
+                }
+            });
+        } catch (IOException e) {
+            log.warn("Failed to list snapshot directory {} for cleanup: {}", keep.getParent(), e.getMessage());
+        }
     }
 
     @Override

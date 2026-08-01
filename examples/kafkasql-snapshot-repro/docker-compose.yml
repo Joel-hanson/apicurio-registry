@@ -1,0 +1,90 @@
+# KafkaSQL snapshot /tmp + startup repro
+#
+#   docker compose up -d
+#   ./run-repro.sh
+#
+# Override Registry image after a local fix:
+#   REGISTRY_IMAGE=apicurio/apicurio-registry:local docker compose up -d
+
+services:
+  kafka:
+    image: apache/kafka:3.9.0
+    hostname: kafka
+    container_name: kafkasql-repro-kafka
+    ports:
+      # Host mapping avoids clashing with a local Kafka already on 9092.
+      # Registry reaches Kafka on the compose network at kafka:9093 (DOCKER listener).
+      - "19092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: CONTROLLER://localhost:9091,HOST://0.0.0.0:9092,DOCKER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: HOST://localhost:9092,DOCKER://kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,HOST:PLAINTEXT,DOCKER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9091
+      KAFKA_INTER_BROKER_LISTENER_NAME: DOCKER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # KafkaSQL journal must retain all events
+      KAFKA_LOG_RETENTION_MS: -1
+      KAFKA_LOG_RETENTION_BYTES: -1
+      # Persist journal + snapshots topics across container force-recreate
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+    networks:
+      - kafkasql-repro
+
+  registry:
+    image: ${REGISTRY_IMAGE:-apicurio/apicurio-registry:latest-snapshot}
+    container_name: kafkasql-repro-registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "${REGISTRY_HOST_PORT:-18080}:8080"
+      # Quarkus management interface (health/metrics) — not on the app port
+      - "${REGISTRY_MANAGEMENT_HOST_PORT:-19000}:9000"
+    environment:
+      APICURIO_STORAGE_KIND: kafkasql
+      APICURIO_KAFKASQL_BOOTSTRAP_SERVERS: kafka:9093
+      # Explicit tmp-like path (mirrors default java.io.tmpdir behavior for demos)
+      APICURIO_STORAGE_SNAPSHOT_LOCATION: /tmp/apicurio-snapshots
+      APICURIO_KAFKASQL_SNAPSHOT_SEEK_ENABLED: ${APICURIO_KAFKASQL_SNAPSHOT_SEEK_ENABLED:-true}
+      APICURIO_KAFKASQL_SNAPSHOT_KAFKA_STORE_ENABLED: ${APICURIO_KAFKASQL_SNAPSHOT_KAFKA_STORE_ENABLED:-false}
+      QUARKUS_HTTP_CORS_ORIGINS: "*"
+    volumes:
+      - ./data/snapshots:/tmp/apicurio-snapshots
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf http://localhost:9000/health/ready > /dev/null || exit 1",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+    networks:
+      - kafkasql-repro
+
+volumes:
+  # Survives `compose up --force-recreate`; wiped only by `compose down -v`
+  kafka-data:
+
+networks:
+  kafkasql-repro:
+    driver: bridge

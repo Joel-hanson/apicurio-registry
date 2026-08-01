@@ -5,6 +5,8 @@ import io.apicurio.registry.storage.impl.kafkasql.KafkaSqlCoordinator;
 import io.apicurio.registry.storage.impl.kafkasql.KafkaSqlMessage;
 import io.apicurio.registry.storage.impl.kafkasql.KafkaSqlMessageKey;
 import io.apicurio.registry.storage.impl.kafkasql.KafkaSqlRegistryStorage;
+import io.apicurio.registry.storage.impl.kafkasql.SnapshotCreationResult;
+import io.apicurio.registry.storage.impl.kafkasql.messages.CreateSnapshot1Message;
 import io.apicurio.registry.storage.impl.sql.SqlRegistryStorage;
 import io.apicurio.registry.types.RegistryException;
 import io.quarkus.arc.lookup.LookupIfProperty;
@@ -89,6 +91,11 @@ public class KafkaSqlSink {
      */
     private Object doProcessMessage(ConsumerRecord<KafkaSqlMessageKey, KafkaSqlMessage> record) {
         KafkaSqlMessage value = record.value();
-        return value.dispatchTo(sqlStore);
+        Object result = value.dispatchTo(sqlStore);
+        // Capture journal coordinates of the snapshot marker so bootstrap can seek past it later.
+        if (value instanceof CreateSnapshot1Message && result instanceof String location) {
+            return new SnapshotCreationResult(location, record.topic(), record.partition(), record.offset());
+        }
+        return result;
     }
 }

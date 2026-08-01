@@ -1,0 +1,5 @@
+data/
+results/
+.docker-context/
+*.sql
+.DS_Store

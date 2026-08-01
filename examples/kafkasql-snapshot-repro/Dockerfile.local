@@ -1,0 +1,25 @@
+# Build context is examples/kafkasql-snapshot-repro/.docker-context/
+# (staged from app/target/quarkus-app because repo .dockerignore excludes **/target)
+#
+# From repo root:
+#   ./mvnw -pl app -am package -DskipTests
+#   mkdir -p examples/kafkasql-snapshot-repro/.docker-context
+#   rm -rf examples/kafkasql-snapshot-repro/.docker-context/quarkus-app
+#   cp -a app/target/quarkus-app examples/kafkasql-snapshot-repro/.docker-context/
+#   docker build -f examples/kafkasql-snapshot-repro/Dockerfile.local \
+#     -t apicurio/apicurio-registry:snapshot-fix \
+#     examples/kafkasql-snapshot-repro/.docker-context
+
+FROM eclipse-temurin:21-jre
+
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY quarkus-app /deployments/
+
+EXPOSE 8080 9000
+
+WORKDIR /deployments
+ENTRYPOINT ["java", "-jar", "/deployments/quarkus-run.jar"]

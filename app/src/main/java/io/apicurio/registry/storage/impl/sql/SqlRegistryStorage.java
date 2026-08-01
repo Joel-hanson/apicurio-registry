@@ -35,8 +35,17 @@ public class SqlRegistryStorage extends AbstractSqlRegistryStorage {
     }
 
     public void restoreFromSnapshot(String snapshotLocation) {
-        handleFactory.withHandle(handle -> handle.createUpdate(sqlStatements.restoreFromSnapshot())
-                .bind(0, snapshotLocation).execute());
+        // Prefer GZIP restore for .sql.gz dumps (current format). Fall back to uncompressed SCRIPT for
+        // legacy .sql files left on disk from older Registry versions.
+        final String sql;
+        if (snapshotLocation != null && snapshotLocation.endsWith(".gz")) {
+            sql = sqlStatements.restoreFromSnapshot();
+        } else if ("h2".equals(sqlStatements.dbType())) {
+            sql = "RUNSCRIPT FROM ?";
+        } else {
+            sql = sqlStatements.restoreFromSnapshot();
+        }
+        handleFactory.withHandle(handle -> handle.createUpdate(sql).bind(0, snapshotLocation).execute());
     }
 
     public void executeSqlStatement(String sqlStatement) {
