@@ -25,6 +25,7 @@ die() { printf '[repro] ERROR: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
 need curl
 need python3
+need docker
 
 if [[ -z "${COMPOSE:-}" ]]; then
   if docker compose version >/dev/null 2>&1; then
@@ -35,6 +36,49 @@ if [[ -z "${COMPOSE:-}" ]]; then
     die "neither 'docker compose' nor 'docker-compose' is available"
   fi
 fi
+
+# shellcheck source=lib-kafka-store-prep.sh
+source "$ROOT/lib-kafka-store-prep.sh"
+
+KAFKA_STORE_ON=false
+case "${APICURIO_KAFKASQL_SNAPSHOT_KAFKA_STORE_ENABLED:-false}" in
+  1|true|TRUE|yes|YES) KAFKA_STORE_ON=true ;;
+esac
+
+wait_kafka_healthy() {
+  local start
+  start="$(date +%s)"
+  log "waiting for kafka healthy ..."
+  while true; do
+    if docker inspect --format '{{.State.Health.Status}}' kafkasql-repro-kafka 2>/dev/null | grep -qx healthy; then
+      return 0
+    fi
+    if (( $(date +%s) - start > 120 )); then
+      die "timed out waiting for kafka healthy"
+    fi
+    sleep 2
+  done
+}
+
+# Bring Kafka up first; when kafka-store is on, fix an already-created snapshots topic
+# (cleanup.policy=delete) before Registry starts — otherwise startup verification fails.
+bring_up_stack() {
+  local force="${1:-0}"
+  if [[ "$force" == "1" ]]; then
+    $COMPOSE up -d --force-recreate kafka
+  else
+    $COMPOSE up -d kafka
+  fi
+  wait_kafka_healthy
+  if [[ "$KAFKA_STORE_ON" == "true" ]]; then
+    ensure_snapshots_topic_for_kafka_store || die "snapshots topic not ready for kafka-store"
+  fi
+  if [[ "$force" == "1" ]]; then
+    $COMPOSE up -d --force-recreate registry
+  else
+    $COMPOSE up -d registry
+  fi
+}
 
 SNAPSHOT_DIR="$ROOT/data/snapshots"
 RESULTS_DIR="$ROOT/results"
@@ -143,9 +187,9 @@ trigger_snapshots() {
 
 log "bringing up stack ..."
 if [[ "$RECREATE" == "1" ]]; then
-  $COMPOSE up -d --force-recreate
+  bring_up_stack 1
 else
-  $COMPOSE up -d
+  bring_up_stack 0
 fi
 
 INITIAL_READY_SEC="$(wait_ready initial)"
@@ -167,9 +211,10 @@ fi
 
 # Cold restart: force-recreate both containers so page cache / container layers are not reused.
 # Kafka named volume keeps journal + snapshots topics; local Registry dumps may still be wiped above.
+# When kafka-store is on, re-apply compact policy before Registry starts (topic may predate kafka-store).
 log "force-recreating kafka + registry (kafka volume retains topics) ..."
 RESTART_START="$(date +%s)"
-$COMPOSE up -d --force-recreate kafka registry
+bring_up_stack 1
 RESTART_READY_SEC="$(wait_ready after-force-recreate "$RESTART_START")"
 log "registry ready after force-recreate in ${RESTART_READY_SEC}s"
 

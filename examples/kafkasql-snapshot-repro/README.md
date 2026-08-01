@@ -77,6 +77,7 @@ Compare especially:
 
 - `local_snapshot_dir.total_bytes` — PVC / `/tmp` pressure  
 - `kafkasql-snapshots.disk_bytes` — grows with kafka-store (Base64 chunks ≈ 4/3 of dump); Registry tombstones older kafka-store snapshots beyond `apicurio.kafkasql.snapshot.kafka-store.retain-count` (default **2**) so compaction can reclaim space (`cleanup.policy=compact,delete` when kafka-store is enabled)  
+- Test scripts call `lib-kafka-store-prep.sh` **before** starting Registry with kafka-store, so an existing `cleanup.policy=delete` topic is altered first (otherwise startup verification fails)  
 - `kafkasql-journal.disk_bytes` — grows with writes regardless of snapshot mode  
 
 Seed alone (Registry already up):

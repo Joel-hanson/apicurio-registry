@@ -245,6 +245,11 @@ record_run "current-clear-dumps" 1 false "$READY_B" "${BOOT_B:-}" "$STATS_FS"
 log "B ready=${READY_B}s bootstrap_ms=${BOOT_B:-unknown}"
 
 # --- publish kafka-resident snapshot on top of existing journal ---
+log "preparing snapshots topic for kafka-store (existing topic may still be cleanup.policy=delete) ..."
+# shellcheck source=lib-kafka-store-prep.sh
+source "$ROOT/lib-kafka-store-prep.sh"
+ensure_snapshots_topic_for_kafka_store || die "snapshots topic not ready for kafka-store"
+
 log "enabling kafka-store and publishing a Kafka-resident snapshot ..."
 # Registry is up without dumps; full replay just happened. Turn store on and snapshot.
 export APICURIO_KAFKASQL_SNAPSHOT_KAFKA_STORE_ENABLED=true
