@@ -58,7 +58,8 @@ def detect_type(path: Path, schemas_root: Path) -> tuple[str, str]:
     return artifact_type, content_type
 
 
-# Types that register reliably without special content-type / rule setup.
+# Types that register reliably on a stock KafkaSQL image without optional providers.
+# Excludes agentcard (needs AGENTCARD provider), protobuf/graphql/thrift (INCLUDE_ALL).
 SAFE_FOLDERS = {
     "openapi",
     "asyncapi",
@@ -68,7 +69,6 @@ SAFE_FOLDERS = {
     "kafkaConnect",
     "kafkaconnect",
     "openrpc",
-    "agentcard",
     "extra",
 }
 
