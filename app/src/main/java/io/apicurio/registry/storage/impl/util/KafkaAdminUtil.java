@@ -65,6 +65,7 @@ public class KafkaAdminUtil {
             } else {
                 log.info("Topic '{}' already exists.", topic);
                 showConfig = false;
+                warnIfExistingSnapshotsTopicNeedsKafkaStoreCompaction(topic);
             }
         } catch (Exception ex) {
             log.error("Could not create topic '" + topic + "'.", ex);
@@ -75,6 +76,28 @@ public class KafkaAdminUtil {
                         properties.entrySet().stream().map(e -> e.getKey() + "=" + e.getValue()).collect(Collectors.joining("\n")));
             }
         }
+    }
+
+    /**
+     * Existing topics are not reconfigured by create. When kafka-store is on, warn early that the
+     * snapshots topic may still be cleanup.policy=delete from a prior install; verification will error
+     * if compaction is missing.
+     */
+    private void warnIfExistingSnapshotsTopicNeedsKafkaStoreCompaction(String topic) {
+        if (!configuration.isResolvable() || configuration.get() == null) {
+            return;
+        }
+        KafkaSqlConfiguration cfg = configuration.get();
+        if (!cfg.isSnapshotKafkaStoreEnabled() || !topic.equals(cfg.getSnapshotsTopic())) {
+            return;
+        }
+        log.warn(
+                "Snapshots topic '{}' already exists while kafka-store is enabled. Registry will not alter "
+                        + "an existing topic's cleanup.policy; it must include 'compact' (recommended "
+                        + "'compact,delete') or startup verification will fail. Example: "
+                        + "kafka-configs.sh --bootstrap-server <brokers> --entity-type topics --entity-name {} "
+                        + "--alter --add-config cleanup.policy=compact,delete,delete.retention.ms=86400000",
+                topic, topic);
     }
 
     /**
@@ -141,11 +164,32 @@ public class KafkaAdminUtil {
         blockOn(toJavaFuture(adminClient.get().get().describeConfigs(singleton(key), options).all())
                 .thenAccept(d -> {
                     var config = d.get(key);
-                    assertConfiguration(topic, config, TopicConfig.CLEANUP_POLICY_CONFIG, "delete"::equals, """
-                            Topic must not have '%s=%s'. While Apicurio Registry will work with topic compaction, it will not have any effect. \
-                            Use '%s=delete', '%s=-1', and '%s=-1' to disable automatic deletion of messages, and perform any cleanup manually after a backup has been made\
-                            """.formatted(TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.CLEANUP_POLICY_COMPACT,
-                            TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.RETENTION_MS_CONFIG, TopicConfig.RETENTION_BYTES_CONFIG));
+                    boolean snapshotsWithKafkaStore = topic.equals(configuration.get().getSnapshotsTopic())
+                            && configuration.get().isSnapshotKafkaStoreEnabled();
+
+                    if (snapshotsWithKafkaStore) {
+                        // Kafka-store publishes large per-snapshot chunk keys and tombstones obsolete ones.
+                        // Compaction (optionally with delete) is required for space reclamation.
+                        // Note: createTopicIfDoesNotExist does not alter an already-existing topic, so a
+                        // snapshots topic created before kafka-store was enabled often still has
+                        // cleanup.policy=delete — fail fast with an actionable alter hint.
+                        assertConfiguration(topic, config, TopicConfig.CLEANUP_POLICY_CONFIG,
+                                KafkaAdminUtil::allowsCompaction,
+                                "When apicurio.kafkasql.snapshot.kafka-store.enabled=true, the snapshots topic "
+                                        + "must use cleanup.policy that includes 'compact' "
+                                        + "(recommended: 'compact,delete') so tombstoned obsolete snapshot chunks "
+                                        + "can be reclaimed. If this topic already existed before kafka-store was "
+                                        + "enabled, Registry does not change its config automatically — alter it, e.g. "
+                                        + "kafka-configs.sh --bootstrap-server <brokers> --entity-type topics "
+                                        + "--entity-name " + topic
+                                        + " --alter --add-config cleanup.policy=compact,delete,delete.retention.ms=86400000");
+                    } else {
+                        assertConfiguration(topic, config, TopicConfig.CLEANUP_POLICY_CONFIG, "delete"::equals, """
+                                Topic must not have '%s=%s'. While Apicurio Registry will work with topic compaction, it will not have any effect. \
+                                Use '%s=delete', '%s=-1', and '%s=-1' to disable automatic deletion of messages, and perform any cleanup manually after a backup has been made\
+                                """.formatted(TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.CLEANUP_POLICY_COMPACT,
+                                TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.RETENTION_MS_CONFIG, TopicConfig.RETENTION_BYTES_CONFIG));
+                    }
 
                     if (!topic.equals(configuration.get().getEventsTopic())) { // Events topic is allowed to use retention. If configured, old events should be eventually deleted.
                         if (!configuration.get().isTopicConfigurationVerificationOverrideEnabled()) {
@@ -159,6 +203,18 @@ public class KafkaAdminUtil {
                                         .formatted(TopicConfig.RETENTION_BYTES_CONFIG, TopicConfig.RETENTION_MS_CONFIG));
                     }
                 }));
+    }
+
+    private static boolean allowsCompaction(String cleanupPolicy) {
+        if (cleanupPolicy == null) {
+            return false;
+        }
+        for (String part : cleanupPolicy.split(",")) {
+            if (TopicConfig.CLEANUP_POLICY_COMPACT.equals(part.trim())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void assertConfiguration(String topic, Config config, String property, Predicate<String> condition, String errorMessage) {

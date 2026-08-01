@@ -125,7 +125,15 @@ public class KafkaSqlConfiguration {
 
         // Snapshots topic supports multiple partitions since snapshots are ordered by timestamp after reading to find out the latest snapshot.
         // Let's use a cluster-default value if not specified.
-        props.putIfAbsent(TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.CLEANUP_POLICY_DELETE);
+        if (snapshotKafkaStoreEnabled) {
+            // Kafka-resident dumps publish large chunk records keyed by snapshot id. Compaction + tombstones
+            // reclaim space after Registry deletes obsolete snapshots (see retain-count).
+            props.putIfAbsent(TopicConfig.CLEANUP_POLICY_CONFIG,
+                    TopicConfig.CLEANUP_POLICY_COMPACT + "," + TopicConfig.CLEANUP_POLICY_DELETE);
+            props.putIfAbsent(TopicConfig.DELETE_RETENTION_MS_CONFIG, "86400000"); // 1d tombstone retention
+        } else {
+            props.putIfAbsent(TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.CLEANUP_POLICY_DELETE);
+        }
         props.putIfAbsent(TopicConfig.RETENTION_MS_CONFIG, "-1");
         props.putIfAbsent(TopicConfig.RETENTION_BYTES_CONFIG, "-1");
 
@@ -157,6 +165,11 @@ public class KafkaSqlConfiguration {
     @Info(category = CATEGORY_STORAGE, description = "Raw dump bytes per Kafka snapshot chunk before Base64 encoding (keep well under broker message.max.bytes).", availableSince = "3.3.1")
     @Getter
     Integer snapshotKafkaStoreChunkBytes;
+
+    @ConfigProperty(name = "apicurio.kafkasql.snapshot.kafka-store.retain-count", defaultValue = "2")
+    @Info(category = CATEGORY_STORAGE, description = "Number of most-recent Kafka-resident snapshots to keep on the snapshots topic. Older kafka-store snapshots are tombstoned after each successful publish so compaction can reclaim space. Minimum 1.", availableSince = "3.3.1")
+    @Getter
+    Integer snapshotKafkaStoreRetainCount;
 
     // === Events topic and related configurations ===
 

@@ -53,4 +53,38 @@ public class KafkaSnapshotStoreTest {
         chunks.put(0, "AA==");
         assertEquals(false, KafkaSnapshotStore.hasAllChunks(chunks, 2));
     }
+
+    @Test
+    void selectObsoleteKeepsNewestRetainCount() {
+        List<KafkaSnapshotStore.PublishedKafkaSnapshot> published = List.of(
+                new KafkaSnapshotStore.PublishedKafkaSnapshot("old", 1L, 3),
+                new KafkaSnapshotStore.PublishedKafkaSnapshot("mid", 2L, 2),
+                new KafkaSnapshotStore.PublishedKafkaSnapshot("new", 3L, 4));
+
+        List<KafkaSnapshotStore.PublishedKafkaSnapshot> obsolete = KafkaSnapshotStore
+                .selectObsoleteKafkaSnapshots(published, 2);
+        assertEquals(1, obsolete.size());
+        assertEquals("old", obsolete.get(0).snapshotId());
+
+        List<String> keys = KafkaSnapshotStore.tombstoneKeys(obsolete.get(0));
+        assertEquals(List.of("old", "old/chunk/0", "old/chunk/1", "old/chunk/2"), keys);
+    }
+
+    @Test
+    void selectObsoleteRetainOne() {
+        List<KafkaSnapshotStore.PublishedKafkaSnapshot> published = List.of(
+                new KafkaSnapshotStore.PublishedKafkaSnapshot("a", 10L, 1),
+                new KafkaSnapshotStore.PublishedKafkaSnapshot("b", 20L, 1));
+        List<KafkaSnapshotStore.PublishedKafkaSnapshot> obsolete = KafkaSnapshotStore
+                .selectObsoleteKafkaSnapshots(published, 1);
+        assertEquals(1, obsolete.size());
+        assertEquals("a", obsolete.get(0).snapshotId());
+    }
+
+    @Test
+    void selectObsoleteNoOpWhenUnderRetainCount() {
+        List<KafkaSnapshotStore.PublishedKafkaSnapshot> published = List.of(
+                new KafkaSnapshotStore.PublishedKafkaSnapshot("only", 1L, 1));
+        assertTrue(KafkaSnapshotStore.selectObsoleteKafkaSnapshots(published, 2).isEmpty());
+    }
 }

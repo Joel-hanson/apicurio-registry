@@ -57,7 +57,27 @@ Compares:
 2. **current-clear-dumps** — dumps wiped, no Kafka chunks → full journal replay  
 3. **proposed-kafka-store-clear** — dumps wiped, restore from Kafka chunks  
 
-Look at `bootstrap_ms` in `results/large-*/summary.json` (more meaningful than wall clock when Quarkus startup dominates).
+Look at `bootstrap_ms` and `performance` in `results/large-*/summary.json`. The same summary includes **`storage`** and **`performance.snapshot_create_avg_wall_ms`** (filesystem-only vs kafka-store create overhead).
+
+Performance dimensions covered:
+
+| Signal | What it tells you |
+|--------|-------------------|
+| `bootstrap_ms` | Restore/replay cost on Registry restart |
+| `snapshot_create_avg_wall_ms` | Extra cost to publish Base64 chunks when kafka-store is on |
+| Steady-state APIs | Not hit except while a snapshot runs (H2 `SCRIPT` blocks the journal consumer briefly) |
+
+Measure storage anytime the stack is up:
+
+```bash
+./measure-storage.sh | tee results/storage-now.json
+```
+
+Compare especially:
+
+- `local_snapshot_dir.total_bytes` — PVC / `/tmp` pressure  
+- `kafkasql-snapshots.disk_bytes` — grows with kafka-store (Base64 chunks ≈ 4/3 of dump); Registry tombstones older kafka-store snapshots beyond `apicurio.kafkasql.snapshot.kafka-store.retain-count` (default **2**) so compaction can reclaim space (`cleanup.policy=compact,delete` when kafka-store is enabled)  
+- `kafkasql-journal.disk_bytes` — grows with writes regardless of snapshot mode  
 
 Seed alone (Registry already up):
 

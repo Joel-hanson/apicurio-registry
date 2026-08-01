@@ -67,12 +67,14 @@ import jakarta.enterprise.event.Event;
 import jakarta.inject.Inject;
 import jakarta.inject.Named;
 import org.apache.commons.lang3.tuple.Pair;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.serialization.StringDeserializer;
 import org.slf4j.Logger;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -82,13 +84,16 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.UUID;
 import java.util.stream.Stream;
 
 import static io.apicurio.registry.storage.impl.kafkasql.KafkaSqlSubmitter.BOOTSTRAP_MESSAGE_TYPE;
+import static io.apicurio.registry.utils.CollectionsUtil.toProperties;
 import static io.apicurio.registry.utils.ConcurrentUtil.blockOnResult;
 
 /**
@@ -1457,7 +1462,104 @@ public class KafkaSqlRegistryStorage extends ReadOnlyDelegatingStorage implement
                 snapshotId, metadataJson, Collections.emptyList());
         blockOnResult(snapshotsProducer.apply(record));
         deleteOlderSnapshotFiles(Path.of(snapshotLocation));
+        if (configuration.isSnapshotKafkaStoreEnabled()) {
+            tombstoneObsoleteKafkaSnapshots(snapshotId);
+        }
         return snapshotLocation;
+    }
+
+    /**
+     * After publishing a kafka-resident snapshot, tombstone older ones beyond retain-count so compaction can
+     * reclaim chunk payload space on the snapshots topic.
+     */
+    private void tombstoneObsoleteKafkaSnapshots(String justPublishedSnapshotId) {
+        int retainCount = configuration.getSnapshotKafkaStoreRetainCount() == null ? 2
+                : Math.max(1, configuration.getSnapshotKafkaStoreRetainCount());
+        try {
+            List<KafkaSnapshotStore.PublishedKafkaSnapshot> published = listPublishedKafkaSnapshots();
+            List<KafkaSnapshotStore.PublishedKafkaSnapshot> obsolete = KafkaSnapshotStore
+                    .selectObsoleteKafkaSnapshots(published, retainCount);
+            if (obsolete.isEmpty()) {
+                log.debug("No obsolete Kafka-resident snapshots to tombstone (retain-count={}).", retainCount);
+                return;
+            }
+            log.info("Tombstoning {} obsolete Kafka-resident snapshot(s); keeping newest {} (just published={}).",
+                    obsolete.size(), retainCount, justPublishedSnapshotId);
+            for (KafkaSnapshotStore.PublishedKafkaSnapshot snap : obsolete) {
+                for (String key : KafkaSnapshotStore.tombstoneKeys(snap)) {
+                    ProducerRecord<String, String> tombstone = new ProducerRecord<>(
+                            configuration.getSnapshotsTopic(), 0, key, null, Collections.emptyList());
+                    blockOnResult(snapshotsProducer.apply(tombstone));
+                }
+            }
+        } catch (Exception e) {
+            // Non-fatal: next snapshot can retry cleanup; topic may grow until then.
+            log.warn("Failed to tombstone obsolete Kafka-resident snapshots: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Scan the snapshots topic for kafka-storage metadata records (and their chunk counts).
+     */
+    private List<KafkaSnapshotStore.PublishedKafkaSnapshot> listPublishedKafkaSnapshots() {
+        Properties props = toProperties(configuration.getConsumerProperties());
+        // Dedicated short-lived group so we do not disturb the bootstrap consumer.
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, "apicurio-snapshot-cleanup-" + UUID.randomUUID());
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+
+        List<KafkaSnapshotStore.PublishedKafkaSnapshot> published = new ArrayList<>();
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props, new StringDeserializer(),
+                new StringDeserializer())) {
+            consumer.subscribe(Collections.singleton(configuration.getSnapshotsTopic()));
+            var assigned = consumer.assignment();
+            List<ConsumerRecord<String, String>> collected = new ArrayList<>();
+            while (assigned.isEmpty()) {
+                ConsumerRecords<String, String> polled = consumer.poll(configuration.getPollTimeout());
+                if (polled != null && !polled.isEmpty()) {
+                    polled.forEach(collected::add);
+                }
+                assigned = consumer.assignment();
+            }
+            var endOffsets = consumer.endOffsets(assigned);
+            ConsumerRecords<String, String> records;
+            do {
+                records = consumer.poll(configuration.getPollTimeout());
+                if (records != null && !records.isEmpty()) {
+                    records.forEach(collected::add);
+                }
+            } while (records != null && !records.isEmpty() && endOffsets.entrySet().stream()
+                    .anyMatch(e -> consumer.position(e.getKey()) < e.getValue()));
+
+            // Prefer max chunk index from live chunk keys when metadata chunkCount is missing.
+            Map<String, Integer> maxChunkIndex = new HashMap<>();
+            for (ConsumerRecord<String, String> rec : collected) {
+                if (rec.value() == null) {
+                    continue; // already tombstoned
+                }
+                KafkaSnapshotStore.ChunkRef chunk = KafkaSnapshotStore.parseChunkKey(rec.key());
+                if (chunk != null) {
+                    maxChunkIndex.merge(chunk.snapshotId(), chunk.index(), Math::max);
+                }
+            }
+
+            for (ConsumerRecord<String, String> rec : collected) {
+                if (rec.key() == null || KafkaSnapshotStore.isChunkKey(rec.key()) || rec.value() == null) {
+                    continue;
+                }
+                SnapshotMetadata metadata = parseSnapshotMetadata(rec.value());
+                if (!KafkaSnapshotStore.isKafkaStorage(metadata)) {
+                    continue;
+                }
+                int chunkCount = metadata.getChunkCount() != null ? metadata.getChunkCount() : 0;
+                if (chunkCount <= 0 && maxChunkIndex.containsKey(rec.key())) {
+                    chunkCount = maxChunkIndex.get(rec.key()) + 1;
+                }
+                published.add(new KafkaSnapshotStore.PublishedKafkaSnapshot(rec.key(), rec.timestamp(),
+                        chunkCount));
+            }
+        }
+        return published;
     }
 
     /**

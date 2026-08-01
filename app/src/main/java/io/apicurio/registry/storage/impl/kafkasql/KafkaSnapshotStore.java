@@ -135,6 +135,44 @@ final class KafkaSnapshotStore {
         return STORAGE_KAFKA.equals(metadata.getStorage().toLowerCase(Locale.ROOT));
     }
 
+    /**
+     * A kafka-resident snapshot discovered on the snapshots topic (metadata key = snapshotId).
+     */
+    record PublishedKafkaSnapshot(String snapshotId, long timestamp, int chunkCount) {
+    }
+
+    /**
+     * Among kafka-resident snapshots, keep the newest {@code retainCount} (by record timestamp) and return
+     * the rest so callers can tombstone their keys.
+     */
+    static List<PublishedKafkaSnapshot> selectObsoleteKafkaSnapshots(List<PublishedKafkaSnapshot> published,
+            int retainCount) {
+        int keep = Math.max(1, retainCount);
+        if (published == null || published.isEmpty()) {
+            return List.of();
+        }
+        // Newest first; stable for equal timestamps.
+        List<PublishedKafkaSnapshot> sorted = new ArrayList<>(published);
+        sorted.sort((a, b) -> Long.compare(b.timestamp(), a.timestamp()));
+        if (sorted.size() <= keep) {
+            return List.of();
+        }
+        return List.copyOf(sorted.subList(keep, sorted.size()));
+    }
+
+    /**
+     * Keys to tombstone for an obsolete kafka-resident snapshot: metadata key plus chunk keys.
+     */
+    static List<String> tombstoneKeys(PublishedKafkaSnapshot obsolete) {
+        List<String> keys = new ArrayList<>();
+        keys.add(obsolete.snapshotId());
+        int chunks = Math.max(0, obsolete.chunkCount());
+        for (int i = 0; i < chunks; i++) {
+            keys.add(chunkKey(obsolete.snapshotId(), i));
+        }
+        return keys;
+    }
+
     record ChunkRef(String snapshotId, int index) {
     }
 
